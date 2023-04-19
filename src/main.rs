@@ -10,6 +10,14 @@ use defmt_rtt as _;
 use embedded_hal::digital::v2::OutputPin;
 use panic_probe as _;
 
+use smart_leds::{SmartLedsWrite, RGB8};
+use ws2812_pio::Ws2812;
+
+const RED: RGB8 = RGB8::new(255, 0, 0);
+const GREEN: RGB8 = RGB8::new(0, 255, 0);
+const BLUE: RGB8 = RGB8::new(0, 0, 255);
+const WHITE: RGB8 = RGB8::new(255, 255, 255);
+
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use rp_pico as bsp;
@@ -58,14 +66,24 @@ fn main() -> ! {
     // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead. If you have
     // a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
     // LED to one of the GPIO pins, and reference that pin here.
-    let mut led_pin = pins.led.into_push_pull_output();
+    let mut neopixel_power = pins.led.into_push_pull_output();
+    neopixel_power.set_high().unwrap();
+    let mut ws = Ws2812::new(
+        pins.neopixel_data.into_mode(),
+        &mut pio,
+        sm0,
+        clocks.peripheral_clock.freq(),
+        timer.count_down(),
+        );
+    let mut led_blue_pin = pins.led_blue.into_push_pulloutput();
+    let mut led_red_pin = pins.led_red.into_push_pulloutput();
+    let mut led_green_pin = pins.led_green.into_push_pulloutput();
 
     loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        info!("off!");
-        led_pin.set_low().unwrap();
+        led_blue_pin.set_low().unwrap();
+        led_red_pin.set_low().unwrap();
+        led_green_pin.set_low().unwrap();
+        ws.write([BLUE].iter().copied()).unwrap();
         delay.delay_ms(500);
     }
 }
