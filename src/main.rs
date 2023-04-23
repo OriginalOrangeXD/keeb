@@ -1,47 +1,90 @@
-//! Blinks the LED on a Pico board
-//!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
-#![no_std]
+// Simple keyboard firmware. Inspired by the RustyKeys project:
+// https://github.com/KOBA789/rusty-keys/blob/main/firmware/keyboard/src/bin/simple.rs
+
 #![no_main]
+#![no_std]
 
-use bsp::entry;
-use defmt::*;
+use usb_device::class::UsbClass;
+mod debounce;
+mod hid_descriptor;
+mod key_codes;
+mod key_mapping;
+mod key_scan;
+
+use core::{cell::RefCell, convert::Infallible};
+use critical_section::Mutex;
+use defmt::{error, info, warn};
 use defmt_rtt as _;
-use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::digital::v2::{InputPin, OutputPin};
 use panic_probe as _;
-
-use smart_leds::{SmartLedsWrite, RGB8};
-use ws2812_pio::Ws2812;
-
-const RED: RGB8 = RGB8::new(255, 0, 0);
-const GREEN: RGB8 = RGB8::new(0, 255, 0);
-const BLUE: RGB8 = RGB8::new(0, 0, 255);
-const WHITE: RGB8 = RGB8::new(255, 255, 255);
-
-// Provide an alias for our BSP so we can switch targets quickly.
-// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
-use rp_pico as bsp;
-// use sparkfun_pro_micro_rp2040 as bsp;
-
-use bsp::hal::{
-    clocks::{init_clocks_and_plls, Clock},
-    pac,
-    sio::Sio,
-    watchdog::Watchdog,
+use rp2040_hal::{
+    pac::{self, interrupt},
+    usb::{self, UsbBus},
+    Clock, Watchdog,
+};
+use usb_device::{bus::UsbBusAllocator, device::UsbDeviceBuilder, prelude::*};
+use usbd_hid::{
+    descriptor::KeyboardReport,
+    hid_class::{
+        HIDClass, HidClassSettings, HidCountryCode, HidProtocol, HidSubClass, ProtocolModeConfig,
+    },
 };
 
-#[entry]
+use debounce::Debounce;
+use key_scan::KeyScan;
+
+/// The rate of polling of the keyboard itself in firmware.
+const SCAN_LOOP_RATE_MS: u32 = 1;
+/// The rate of USB interrupt polling the device will ask of the host.
+const USB_POLL_RATE_MS: u8 = SCAN_LOOP_RATE_MS as u8;
+/// The number of milliseconds to wait until a "key-off-then-key-on" in quick succession is allowed.
+const DEBOUNCE_MS: u8 = 6;
+
+const DEBOUNCE_TICKS: u8 = DEBOUNCE_MS / (SCAN_LOOP_RATE_MS as u8);
+
+/// The linker will place this boot block at the start of our program image. We
+/// need this to help the ROM bootloader get our code up and running.
+#[link_section = ".boot2"]
+#[used]
+pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+
+const NUM_COLS: usize = 6;
+const NUM_ROWS: usize = 8;
+
+const EXTERNAL_CRYSTAL_FREQUENCY_HZ: u32 = 12_000_000;
+
+/// The USB Device Driver (shared with the interrupt).
+static mut USB_DEVICE: Option<UsbDevice<usb::UsbBus>> = None;
+
+/// The USB Bus Driver (shared with the interrupt).
+static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBus>> = None;
+
+/// The USB Human Interface Device Driver (shared with the interrupt).
+static mut USB_HID: Option<HIDClass<usb::UsbBus>> = None;
+
+/// The latest keyboard report for responding to USB interrupts.
+static KEYBOARD_REPORT: Mutex<RefCell<KeyboardReport>> = Mutex::new(RefCell::new(KeyboardReport {
+    modifier: 0,
+    reserved: 0,
+    leds: 0,
+    keycodes: [0u8; 6],
+}));
+
+#[defmt::panic_handler]
+fn panic() -> ! {
+    cortex_m::asm::udf()
+}
+
+#[cortex_m_rt::entry]
 fn main() -> ! {
-    info!("Program start");
+    info!("Start of main()");
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let sio = Sio::new(pac.SIO);
 
-    // External high-speed crystal on the pico board is 12Mhz
-    let external_xtal_freq_hz = 12_000_000u32;
-    let clocks = init_clocks_and_plls(
-        external_xtal_freq_hz,
+    let mut watchdog = Watchdog::new(pac.WATCHDOG);
+
+    let clocks = rp2040_hal::clocks::init_clocks_and_plls(
+        EXTERNAL_CRYSTAL_FREQUENCY_HZ,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -52,40 +95,156 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
+    // Get the GPIO peripherals.
+    let sio = rp2040_hal::Sio::new(pac.SIO);
+
+    let pins =
+        rp2040_hal::gpio::Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
+
+    // Set up keyboard matrix pins.
+    let rows: &[&dyn InputPin<Error = Infallible>] = &[
+        &pins.gpio6.into_pull_down_input(),
+        &pins.gpio7.into_pull_down_input(),
+        &pins.gpio8.into_pull_down_input(),
+        &pins.gpio9.into_pull_down_input(),
+        &pins.gpio13.into_pull_down_input(),
+        &pins.gpio14.into_pull_down_input(),
+        &pins.gpio15.into_pull_down_input(),
+        &pins.gpio26.into_pull_down_input(),
+    ];
+
+    let cols: &mut [&mut dyn OutputPin<Error = Infallible>] = &mut [
+        &mut pins.gpio0.into_push_pull_output(),
+        &mut pins.gpio1.into_push_pull_output(),
+        &mut pins.gpio2.into_push_pull_output(),
+        &mut pins.gpio3.into_push_pull_output(),
+        &mut pins.gpio4.into_push_pull_output(),
+        &mut pins.gpio5.into_push_pull_output(),
+    ];
+
+    // Initialize a delay for accurate sleeping.
     let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
-    let pins = bsp::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
+    let mut modifier_mask = [[false; NUM_ROWS]; NUM_COLS];
+    for (col, mapping_col) in modifier_mask.iter_mut().zip(key_mapping::NORMAL_LAYER_MAPPING) {
+        for (key, mapping_key) in col.iter_mut().zip(mapping_col) {
+            *key = mapping_key.is_modifier();
+        }
+    }
+
+    // Create a global debounce state to prevent unintended rapid key double-presses.
+    let mut debounce: Debounce<NUM_ROWS, NUM_COLS> = Debounce::new(DEBOUNCE_TICKS, modifier_mask);
+
+    // Do an initial scan of the keys so that we immediately have something to report to the host when asked.
+    let scan = KeyScan::scan(rows, cols, &mut delay, &mut debounce);
+    critical_section::with(|cs| {
+        KEYBOARD_REPORT.replace(cs, scan.into());
+    });
+
+    // If the Escape key is pressed during power-on, we should go into bootloader mode.
+    if scan[0][0] {
+        let gpio_activity_pin_mask = 0;
+        let disable_interface_mask = 0;
+        info!("Escape key detected on boot, going into bootloader mode.");
+        rp2040_hal::rom_data::reset_to_usb_boot(gpio_activity_pin_mask, disable_interface_mask);
+    }
+
+    info!("Initializing USB");
+    // Initialize USB
+    let force_vbus_detect_bit = true;
+    let usb_bus = UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        force_vbus_detect_bit,
         &mut pac.RESETS,
     );
+    let bus_allocator = UsbBusAllocator::new(usb_bus);
+    let bus_ref = unsafe {
+        // Note (safety): This is safe as interrupts haven't been started yet
+        USB_BUS = Some(bus_allocator);
+        // We are promising to the compiler not to take mutable access to this global
+        // variable while this reference exists!
+        USB_BUS.as_ref().unwrap()
+    };
 
-    // This is the correct pin on the Raspberry Pico board. On other boards, even if they have an
-    // on-board LED, it might need to be changed.
-    // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead. If you have
-    // a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
-    // LED to one of the GPIO pins, and reference that pin here.
-    let mut neopixel_power = pins.led.into_push_pull_output();
-    neopixel_power.set_high().unwrap();
-    let mut ws = Ws2812::new(
-        pins.neopixel_data.into_mode(),
-        &mut pio,
-        sm0,
-        clocks.peripheral_clock.freq(),
-        timer.count_down(),
-        );
-    let mut led_blue_pin = pins.led_blue.into_push_pulloutput();
-    let mut led_red_pin = pins.led_red.into_push_pulloutput();
-    let mut led_green_pin = pins.led_green.into_push_pulloutput();
+    let hid_endpoint = HIDClass::new_with_settings(
+        bus_ref,
+        hid_descriptor::KEYBOARD_REPORT_DESCRIPTOR,
+        USB_POLL_RATE_MS,
+        HidClassSettings {
+            subclass: HidSubClass::NoSubClass,
+            protocol: HidProtocol::Keyboard,
+            config: ProtocolModeConfig::ForceReport,
+            locale: HidCountryCode::US,
+        },
+    );
 
+    // https://github.com/obdev/v-usb/blob/7a28fdc685952412dad2b8842429127bc1cf9fa7/usbdrv/USB-IDs-for-free.txt#L128
+    let keyboard_usb_device = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27db))
+        .manufacturer("robby")
+        .product("rubbyKeeb")
+        .supports_remote_wakeup(true)
+        .build();
+    unsafe {
+        // Note (safety): This is safe as interrupts haven't been started yet
+        USB_HID = Some(hid_endpoint);
+        USB_DEVICE = Some(keyboard_usb_device);
+    }
+    info!("Enabling USB interrupt handler");
+    unsafe {
+        pac::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
+    }
+    info!("Entering main loop");
     loop {
-        led_blue_pin.set_low().unwrap();
-        led_red_pin.set_low().unwrap();
-        led_green_pin.set_low().unwrap();
-        ws.write([BLUE].iter().copied()).unwrap();
-        delay.delay_ms(500);
+        let scan = KeyScan::scan(rows, cols, &mut delay, &mut debounce);
+        critical_section::with(|cs| {
+            KEYBOARD_REPORT.replace(cs, scan.into());
+        });
+        delay.delay_ms(SCAN_LOOP_RATE_MS);
     }
 }
 
-// End of file
+/// Handle USB interrupts, used by the host to "poll" the keyboard for new inputs.
+#[allow(non_snake_case)]
+#[interrupt]
+unsafe fn USBCTRL_IRQ() {
+    let usb_dev = USB_DEVICE.as_mut().unwrap();
+    let usb_hid = USB_HID.as_mut().unwrap();
+
+    if usb_dev.poll(&mut [usb_hid]) {
+        usb_hid.poll();
+    }
+
+    let report = critical_section::with(|cs| *KEYBOARD_REPORT.borrow_ref(cs));
+    if let Err(err) = usb_hid.push_input(&report) {
+        match err {
+            UsbError::WouldBlock => warn!("UsbError::WouldBlock"),
+            UsbError::ParseError => error!("UsbError::ParseError"),
+            UsbError::BufferOverflow => error!("UsbError::BufferOverflow"),
+            UsbError::EndpointOverflow => error!("UsbError::EndpointOverflow"),
+            UsbError::EndpointMemoryOverflow => error!("UsbError::EndpointMemoryOverflow"),
+            UsbError::InvalidEndpoint => error!("UsbError::InvalidEndpoint"),
+            UsbError::Unsupported => error!("UsbError::Unsupported"),
+            UsbError::InvalidState => error!("UsbError::InvalidState"),
+        }
+    }
+
+    // macOS doesn't like it when you don't pull this, apparently.
+    // TODO: maybe even parse something here
+    usb_hid.pull_raw_output(&mut [0; 64]).ok();
+
+    // Wake the host if a key is pressed and the device supports
+    // remote wakeup.
+    if !report_is_empty(&report)
+        && usb_dev.state() == UsbDeviceState::Suspend
+        && usb_dev.remote_wakeup_enabled()
+    {
+        usb_dev.bus().remote_wakeup();
+    }
+}
+
+fn report_is_empty(report: &KeyboardReport) -> bool {
+    report.modifier != 0
+        || report.keycodes.iter().any(|key| *key != key_codes::KeyCode::Empty as u8)
+}
