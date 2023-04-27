@@ -90,6 +90,7 @@ pub enum KeyCode {
     // Keypad keys
     LeftParen = 0xB6,
     RightParen = 0xB7,
+    Exclaim = 0xcf,
 
     // Modifier keys
     Fn = 0xF0,
