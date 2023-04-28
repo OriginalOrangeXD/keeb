@@ -6,8 +6,8 @@ pub const NORMAL_LAYER_MAPPING: [[KeyCode; NUM_ROWS]; NUM_COLS] = [
     [KeyCode::Empty, KeyCode::L,     KeyCode::S,     KeyCode::Z,         KeyCode::Num2,  KeyCode::Empty, KeyCode::Empty, KeyCode::Empty],
     [KeyCode::R,     KeyCode::N,     KeyCode::V,     KeyCode::Empty,     KeyCode::Num3,KeyCode::Empty, KeyCode::Empty, KeyCode::Empty],
     [KeyCode::C,     KeyCode::T,     KeyCode::W,     KeyCode::Empty,        KeyCode::Num4,       KeyCode::Empty, KeyCode::Empty, KeyCode::Empty],
-    [KeyCode::G,     KeyCode::H,     KeyCode::M,     KeyCode::Empty,      KeyCode::RightShift,      KeyCode::Fn,   KeyCode::RightCtrl, KeyCode::Enter],
-    [KeyCode::F,     KeyCode::D,     KeyCode::B,     KeyCode::Backspace, KeyCode::Fn,      KeyCode::Empty,   KeyCode::Empty, KeyCode::Empty],
+    [KeyCode::G,     KeyCode::H,     KeyCode::M,     KeyCode::Empty,      KeyCode::Backspace,      KeyCode::Fn,   KeyCode::RightCtrl, KeyCode::Enter],
+    [KeyCode::F,     KeyCode::D,     KeyCode::B,     KeyCode::RightShift, KeyCode::Fn,      KeyCode::Empty,   KeyCode::Empty, KeyCode::Empty],
 ];
 pub const NORMAL_LAYER_MAPPING_arrow: [[KeyCode; NUM_ROWS]; NUM_COLS] = [
     [KeyCode::Exclaim, KeyCode::ForwardSlash, KeyCode::Minus, KeyCode::Empty,     KeyCode::Empty,      KeyCode::Empty, KeyCode::Empty, KeyCode::Empty],
